@@ -1,7 +1,9 @@
-name: astrbot_plugin_kb_plus
-display_name: kb_plus
-desc: AstrBot 知识库增强检索插件，提供 kb list、kb ask、kb free、可配置 top_k 与专用 kb_plus 工具链。
-version: v0.2.0
-author: shijinkarusui
-repo: https://github.com/shijinkarusui/astrbot_plugin_kb_plus
-"tags": ["知识库", "指定检索"]
+{
+  "name": astrbot_plugin_kb_plus,
+  "display_name": 知识库检索增强,
+  "desc": AstrBot 知识库增强检索插件，提供 kb list、kb ask、kb free、可配置 top_k 与专用 kb_plus 工具链,
+  "version": v0.2.0,
+  "author": shijinkarusui,
+  "repo": https://github.com/shijinkarusui/astrbot_plugin_kb_plus,
+  "tags": ["知识库", "指定检索"]
+}
