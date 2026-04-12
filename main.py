@@ -9,9 +9,11 @@ from astrbot.core.agent.tool import ToolSet
 
 @register("kb_plus", "shijinkarusui", "AstrBot 知识库增强检索插件", "0.2.0")
 class KBPlusPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig | None = None):
+    # 把 config 的类型从 AstrBotConfig 改为 dict
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
+
 
     @filter.command_group("kb")
     def kb(self):
@@ -90,8 +92,16 @@ class KBPlusPlugin(Star):
         query: str,
         kb_names_text: str = "",
         doc_names_text: str = "",
-        top_k: int = 0,
     ) -> str:
+        """对指定知识库或文件范围执行知识库检索，并返回结果摘要。
+
+        Args:
+            query(string): 用户要查询的问题。
+            kb_names_text(string): 逗号分隔的知识库名称列表，不填则表示不限制知识库。
+            doc_names_text(string): 逗号分隔的文件名称列表，不填则表示不限制文件名。
+        """
+        top_k = 0 # 强行把 top_k 设为 0
+        kb_names = self._split_csv(kb_names_text)
         """对指定知识库或文件范围执行知识库检索，并返回结果摘要。
 
         Args:
