@@ -2,20 +2,38 @@
   "default_top_k": {
     "description": "默认返回结果数量",
     "type": "int",
-    "hint": "当命令或工具没有显式传 top_k，或传 0 时，使用这个默认值。",
+    "hint": "astr_plus_kb_search 固定按该数量返回结果。",
     "default": 5
   },
   "max_top_k": {
     "description": "允许的最大返回结果数量",
     "type": "int",
-    "hint": "用于限制工具或命令传入的 top_k 上限，避免返回过多结果。",
+    "hint": "用于约束 default_top_k 的上限，避免返回过多结果。",
     "default": 10
   },
   "strict_doc_chunk_limit": {
-    "description": "严格文件检索时每个文件最多读取的 chunk 数量",
+    "description": "严格文件检索时每个文件最多读取的候选 chunk 数量",
     "type": "int",
-    "hint": "指定文件检索时，会只在目标文件 chunks 中评分排序。这个值用于限制每个文件读取的 chunk 数量。",
+    "hint": "指定文件检索时，用于限制向量召回与重排序的候选窗口大小。",
     "default": 1000
+  },
+  "strict_retrieve_concurrency": {
+    "description": "严格文件检索时的并发任务数",
+    "type": "int",
+    "hint": "指定文件检索时，允许同时发起的向量查询并发数。",
+    "default": 4
+  },
+  "strict_fetch_k_factor": {
+    "description": "严格文件检索时的候选窗口放大倍数",
+    "type": "int",
+    "hint": "指定文件检索时，向量召回候选窗口 = top_k * 放大倍数。",
+    "default": 4
+  },
+  "strict_rerank_fusion_ratio": {
+    "description": "严格文件检索时的重排融合权重",
+    "type": "float",
+    "hint": "指定文件检索时，重排分的融合权重（0-1）。最终分数 = 该权重 * 重排分 + (1-该权重) * 向量分。",
+    "default": 0.8
   },
   "enable_multi_round_hint": {
     "description": "是否在 kb ask/free 中强化多轮工具调用提示",

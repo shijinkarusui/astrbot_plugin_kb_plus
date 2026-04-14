@@ -1,3 +1,4 @@
+import asyncio
 import json
 from difflib import SequenceMatcher
 
@@ -7,13 +8,17 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.agent.tool import ToolSet
 
 
-@register("kb_plus", "shijinkarusui", "AstrBot 知识库增强检索插件", "0.2.0")
+@register("kb_plus", "shijinkarusui", "AstrBot 知识库增强检索插件", "0.3.0")
 class KBPlusPlugin(Star):
-    # 把 config 的类型从 AstrBotConfig 改为 dict
-    def __init__(self, context: Context, config: dict = None):
+    FUZZY_MATCH_THRESHOLD = 0.72
+    DOC_SCAN_LIMIT = 1000
+    DEFAULT_STRICT_RETRIEVE_CONCURRENCY = 4
+    DEFAULT_STRICT_FETCH_K_FACTOR = 4
+    DEFAULT_STRICT_RERANK_FUSION_RATIO = 0.8
+
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config = config or {}
-
 
     @filter.command_group("kb")
     def kb(self):
@@ -95,24 +100,17 @@ class KBPlusPlugin(Star):
     ) -> str:
         """对指定知识库或文件范围执行知识库检索，并返回结果摘要。
 
-        Args:
-            query(string): 用户要查询的问题。
-            kb_names_text(string): 逗号分隔的知识库名称列表，不填则表示不限制知识库。
-            doc_names_text(string): 逗号分隔的文件名称列表，不填则表示不限制文件名。
-        """
-        top_k = 0 # 强行把 top_k 设为 0
-        kb_names = self._split_csv(kb_names_text)
-        """对指定知识库或文件范围执行知识库检索，并返回结果摘要。
+        返回数量固定使用插件配置 `default_top_k`（并受 `max_top_k` 上限约束），
+        不接受模型侧动态指定，避免不同轮次返回规模漂移。
 
         Args:
             query(string): 用户要查询的问题。
             kb_names_text(string): 逗号分隔的知识库名称列表，不填则表示不限制知识库。
             doc_names_text(string): 逗号分隔的文件名称列表，不填则表示不限制文件名。
-            top_k(number): 返回的结果数量，传 0 表示使用插件默认值。
         """
         kb_names = self._split_csv(kb_names_text)
         doc_names = self._split_csv(doc_names_text)
-        resolved_top_k = self._resolve_top_k(top_k)
+        resolved_top_k = self._resolve_top_k(0)
         return await self._tool_kb_search_impl(
             query,
             kb_names,
@@ -154,6 +152,39 @@ class KBPlusPlugin(Star):
             value = 1000
         return max(1, value)
 
+    def _get_strict_retrieve_concurrency(self) -> int:
+        value = self.config.get(
+            "strict_retrieve_concurrency",
+            self.DEFAULT_STRICT_RETRIEVE_CONCURRENCY,
+        )
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = self.DEFAULT_STRICT_RETRIEVE_CONCURRENCY
+        return max(1, value)
+
+    def _get_strict_fetch_k_factor(self) -> int:
+        value = self.config.get(
+            "strict_fetch_k_factor",
+            self.DEFAULT_STRICT_FETCH_K_FACTOR,
+        )
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = self.DEFAULT_STRICT_FETCH_K_FACTOR
+        return max(1, value)
+
+    def _get_strict_rerank_fusion_ratio(self) -> float:
+        value = self.config.get(
+            "strict_rerank_fusion_ratio",
+            self.DEFAULT_STRICT_RERANK_FUSION_RATIO,
+        )
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = self.DEFAULT_STRICT_RERANK_FUSION_RATIO
+        return max(0.0, min(1.0, value))
+
     def _resolve_top_k(self, top_k: int | None) -> int:
         default_top_k = self._get_default_top_k()
         max_top_k = self._get_max_top_k()
@@ -164,6 +195,15 @@ class KBPlusPlugin(Star):
         if requested <= 0:
             requested = default_top_k
         return max(1, min(requested, max_top_k))
+
+    def _resolve_doc_fetch_k(self, chunk_count: int, top_k: int) -> int:
+        strict_limit = self._get_strict_doc_chunk_limit()
+        factor = self._get_strict_fetch_k_factor()
+        base_window = max(top_k * factor, top_k)
+        fetch_k = min(base_window, strict_limit)
+        if chunk_count > 0:
+            fetch_k = min(fetch_k, chunk_count)
+        return max(top_k, fetch_k)
 
     def _build_kb_only_tool_set(self) -> ToolSet:
         tool_mgr = self.context.get_llm_tool_manager()
@@ -184,10 +224,6 @@ class KBPlusPlugin(Star):
         cid = await conv_mgr.get_curr_conversation_id(umo)
         if not cid:
             cid = await conv_mgr.new_conversation(umo, event.get_platform_id())
-        conversation = await conv_mgr.get_conversation(umo, cid)
-        if conversation:
-            return conversation
-        cid = await conv_mgr.new_conversation(umo, event.get_platform_id())
         conversation = await conv_mgr.get_conversation(umo, cid)
         if not conversation:
             raise RuntimeError("无法创建新的对话。")
@@ -237,7 +273,7 @@ class KBPlusPlugin(Star):
             kb_helper = await self.context.kb_manager.get_kb(kb.kb_id)
             if not kb_helper:
                 continue
-            docs = await kb_helper.list_documents(limit=1000)
+            docs = await kb_helper.list_documents(limit=self.DOC_SCAN_LIMIT)
             doc_names = [doc.doc_name for doc in docs]
 
             if keyword_norm:
@@ -332,40 +368,166 @@ class KBPlusPlugin(Star):
         if not doc_targets:
             return []
 
-        scored_chunks = []
-        query_norm = self._normalize(query)
-        query_tokens = self._tokenize_text(query)
+        kb_helper_map = {
+            target["kb_id"]: target["kb_helper"]
+            for target in doc_targets
+        }
 
-        for target in doc_targets:
+        semaphore = asyncio.Semaphore(self._get_strict_retrieve_concurrency())
+
+        async def retrieve_target(target: dict) -> list[dict]:
             kb_helper = target["kb_helper"]
-            chunks = await kb_helper.get_chunks_by_doc_id(
-                target["doc_id"],
-                limit=self._get_strict_doc_chunk_limit(),
-            )
-            for chunk in chunks:
-                content = chunk.get("content", "")
-                score = self._score_chunk_text(content, query_norm, query_tokens)
-                if score <= 0:
-                    continue
-                scored_chunks.append(
-                    {
-                        "chunk_id": chunk.get("chunk_id", ""),
-                        "doc_id": target["doc_id"],
-                        "kb_id": target["kb_id"],
-                        "kb_name": target["kb_name"],
-                        "doc_name": target["doc_name"],
-                        "chunk_index": chunk.get("chunk_index", 0),
-                        "content": content,
-                        "score": score,
-                        "char_count": chunk.get("char_count", len(content)),
-                    }
-                )
+            async with semaphore:
+                if not getattr(kb_helper, "vec_db", None):
+                    await kb_helper.initialize()
 
-        scored_chunks.sort(
+                fetch_k = self._resolve_doc_fetch_k(
+                    chunk_count=int(target.get("chunk_count", 0) or 0),
+                    top_k=top_k,
+                )
+                try:
+                    vec_results = await kb_helper.vec_db.retrieve(
+                        query=query,
+                        k=fetch_k,
+                        fetch_k=fetch_k,
+                        rerank=False,
+                        metadata_filters={
+                            "kb_id": target["kb_id"],
+                            "kb_doc_id": target["doc_id"],
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning(f"向量检索失败({target['kb_name']}/{target['doc_name']}): {exc}")
+                    return []
+
+            chunks: list[dict] = []
+            for result in vec_results:
+                chunk = self._build_chunk_from_vec_result(target, result)
+                if chunk:
+                    chunks.append(chunk)
+            return chunks
+
+        retrieve_tasks = [retrieve_target(target) for target in doc_targets]
+        retrieved_batches = await asyncio.gather(*retrieve_tasks)
+        candidate_chunks = [item for batch in retrieved_batches for item in batch]
+
+        if not candidate_chunks:
+            return []
+
+        reranked_chunks = await self._rerank_candidate_chunks(
+            query=query,
+            candidate_chunks=candidate_chunks,
+            kb_helper_map=kb_helper_map,
+        )
+        reranked_chunks.sort(
             key=lambda item: (item["score"], -int(item.get("chunk_index", 0))),
             reverse=True,
         )
-        return scored_chunks[:top_k]
+        return reranked_chunks[:top_k]
+
+    def _build_chunk_from_vec_result(self, target: dict, result) -> dict | None:
+        data = result.data or {}
+        metadata_raw = data.get("metadata", "{}")
+        if isinstance(metadata_raw, str):
+            try:
+                metadata = json.loads(metadata_raw)
+            except Exception:
+                metadata = {}
+        elif isinstance(metadata_raw, dict):
+            metadata = metadata_raw
+        else:
+            metadata = {}
+
+        content = data.get("text", "")
+        if not content:
+            return None
+
+        return {
+            "chunk_id": data.get("doc_id", ""),
+            "doc_id": target["doc_id"],
+            "kb_id": target["kb_id"],
+            "kb_name": target["kb_name"],
+            "doc_name": target["doc_name"],
+            "chunk_index": int(metadata.get("chunk_index", 0) or 0),
+            "content": content,
+            "score": float(getattr(result, "similarity", 0.0)),
+            "char_count": len(content),
+        }
+
+    def _normalize_scores(self, items: list[dict], key: str) -> list[float]:
+        if not items:
+            return []
+        values = [float(item.get(key, 0.0)) for item in items]
+        min_value = min(values)
+        max_value = max(values)
+        if max_value <= min_value:
+            return [1.0 for _ in values]
+        return [(value - min_value) / (max_value - min_value) for value in values]
+
+    async def _rerank_candidate_chunks(
+        self,
+        query: str,
+        candidate_chunks: list[dict],
+        kb_helper_map: dict[str, object],
+    ) -> list[dict]:
+        reranked_chunks: list[dict] = []
+        kb_chunk_groups: dict[str, list[dict]] = {}
+        for item in candidate_chunks:
+            kb_chunk_groups.setdefault(item["kb_id"], []).append(item)
+
+        for kb_id, chunks in kb_chunk_groups.items():
+            kb_helper = kb_helper_map.get(kb_id)
+            vec_db = getattr(kb_helper, "vec_db", None) if kb_helper else None
+            rerank_provider = getattr(vec_db, "rerank_provider", None) if vec_db else None
+            if not rerank_provider:
+                normalized_dense_scores = self._normalize_scores(chunks, "score")
+                for idx, chunk in enumerate(chunks):
+                    item = dict(chunk)
+                    item["score"] = normalized_dense_scores[idx]
+                    reranked_chunks.append(item)
+                continue
+
+            documents = [item["content"] for item in chunks]
+            top_n = min(len(documents), self._get_strict_doc_chunk_limit())
+            try:
+                rerank_results = await rerank_provider.rerank(
+                    query=query,
+                    documents=documents,
+                    top_n=top_n,
+                )
+            except Exception as exc:
+                logger.warning(f"重排序失败(kb_id={kb_id}): {exc}")
+                normalized_dense_scores = self._normalize_scores(chunks, "score")
+                for idx, chunk in enumerate(chunks):
+                    item = dict(chunk)
+                    item["score"] = normalized_dense_scores[idx]
+                    reranked_chunks.append(item)
+                continue
+
+            rerank_score_map: dict[int, float] = {
+                int(item.index): float(item.relevance_score)
+                for item in rerank_results
+                if 0 <= int(item.index) < len(chunks)
+            }
+            rerank_min = min(rerank_score_map.values()) if rerank_score_map else 0.0
+            rerank_max = max(rerank_score_map.values()) if rerank_score_map else 0.0
+            dense_scores = self._normalize_scores(chunks, "score")
+
+            for idx, chunk in enumerate(chunks):
+                dense_score = dense_scores[idx]
+                rerank_raw = rerank_score_map.get(idx)
+                if rerank_raw is None or rerank_max <= rerank_min:
+                    rerank_score = dense_score
+                else:
+                    rerank_score = (rerank_raw - rerank_min) / (rerank_max - rerank_min)
+                fusion_ratio = self._get_strict_rerank_fusion_ratio()
+                item = dict(chunk)
+                item["score"] = (
+                    fusion_ratio * rerank_score + (1.0 - fusion_ratio) * dense_score
+                )
+                reranked_chunks.append(item)
+
+        return reranked_chunks
 
     async def _resolve_doc_targets(
         self,
@@ -378,7 +540,7 @@ class KBPlusPlugin(Star):
             kb_helper = await self.context.kb_manager.get_kb_by_name(kb_name)
             if not kb_helper:
                 continue
-            docs = await kb_helper.list_documents(limit=1000)
+            docs = await kb_helper.list_documents(limit=self.DOC_SCAN_LIMIT)
             for doc in docs:
                 if self._normalize(doc.doc_name) not in normalized_doc_names:
                     continue
@@ -389,6 +551,7 @@ class KBPlusPlugin(Star):
                         "kb_name": kb_helper.kb.kb_name,
                         "doc_id": doc.doc_id,
                         "doc_name": doc.doc_name,
+                        "chunk_count": int(getattr(doc, "chunk_count", 0) or 0),
                     }
                 )
         return targets
@@ -417,34 +580,6 @@ class KBPlusPlugin(Star):
 
         return "\n".join(lines).strip()
 
-    def _score_chunk_text(
-        self,
-        content: str,
-        query_norm: str,
-        query_tokens: list[str],
-    ) -> float:
-        content_norm = self._normalize(content)
-        if not content_norm:
-            return 0.0
-
-        score = 0.0
-        if query_norm and query_norm in content_norm:
-            score += 3.0
-
-        for token in query_tokens:
-            if token and token in content_norm:
-                score += 1.2
-
-        score += SequenceMatcher(None, content_norm[:500], query_norm).ratio()
-        return score
-
-    def _tokenize_text(self, text: str) -> list[str]:
-        separators = ["，", ",", "；", ";", "？", "?", "。", ".", "\n", "\t"]
-        normalized = text
-        for separator in separators:
-            normalized = normalized.replace(separator, " ")
-        return [token for token in normalized.split() if token]
-
     async def _match_targets_structured(self, target_text: str) -> dict:
         tokens = self._split_csv(target_text)
         kbs = await self.context.kb_manager.list_kbs()
@@ -453,7 +588,7 @@ class KBPlusPlugin(Star):
             kb_helper = await self.context.kb_manager.get_kb(kb.kb_id)
             if not kb_helper:
                 continue
-            docs = await kb_helper.list_documents(limit=1000)
+            docs = await kb_helper.list_documents(limit=self.DOC_SCAN_LIMIT)
             kb_entries.append(
                 {
                     "kb_name": kb.kb_name,
@@ -525,14 +660,6 @@ class KBPlusPlugin(Star):
             return text[len(prefix) :].strip()
         return text
 
-    def _guess_targets_from_question(self, question: str) -> str:
-        separators = ["，", ",", "；", ";", "？", "?", "。", "\n"]
-        text = question
-        for separator in separators:
-            text = text.replace(separator, " ")
-        words = [word.strip() for word in text.split(" ") if word.strip()]
-        return ",".join(words[:8])
-
     def _split_csv(self, text: str) -> list[str]:
         if not text:
             return []
@@ -556,7 +683,10 @@ class KBPlusPlugin(Star):
             return True
         if keyword_norm in candidate_norm or candidate_norm in keyword_norm:
             return True
-        return SequenceMatcher(None, candidate_norm, keyword_norm).ratio() >= 0.72
+        return (
+            SequenceMatcher(None, candidate_norm, keyword_norm).ratio()
+            >= self.FUZZY_MATCH_THRESHOLD
+        )
 
     def _dedupe_preserve_order(self, items: list[str]) -> list[str]:
         seen = set()
